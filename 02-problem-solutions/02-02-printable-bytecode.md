@@ -12,6 +12,7 @@ enum Constant {
   Count(u64),
   String(String),
   Vector(Vec<u32>),
+  // Function pointers and types would be constants too!!
 }
 ```
 
@@ -52,6 +53,12 @@ This means that functions are just any other global, just with a function type. 
 > [!NOTE]
 > Since we look it up in a hash map, it could be slow. Once we run it once, we can cache where it lives in memory. This is called [inline caching](https://en.wikipedia.org/wiki/Inline_caching).
 
+## Exports
+
+A script may export many things. We need a separate section that describes which identifiers get exported and what their values are.
+
+First, the value is defined in the constant pool. Then, we add an entry to the exports list, which maps a global name to the index into the constant pool. Then, the VM will register all of the exported names into persistent memory.
+
 # Proposal
 
 The bytecode itself would be extremely simple. Imagine the Rust struct as:
@@ -60,6 +67,7 @@ The bytecode itself would be extremely simple. Imagine the Rust struct as:
 struct Bytecode {
   consts: Vec<Constant>,
   instrs: Vec<Instruction>,
+  exports: Vec<(String, ConstIdx)>,
   // Importantly, we will probably need a mapping of instruction index to
   // "span" for debug info, which is printed if given a debug option.
   spans: Vec<(u32, u64)>,
