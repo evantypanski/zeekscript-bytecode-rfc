@@ -1,4 +1,4 @@
-# Problem 1: Tight Coupling
+# Problem 1: Memory Model
 
 The scripting implementation is deeply coupled with Zeek. Any analyzer written in C++ *directly creates* pointers to script values. Many plugins and core components take in script values in BiFs (built-in functions), translate them into C++ types, then pass that along to some other system.
 
@@ -27,10 +27,10 @@ struct ZVal {
 		double as_double; // double double_val
 		
 		// ZVal then has a list of pointers that it uses. Instead, we will
-		// have two options: an offset (which is the new, fast one) and a
+		// have two options: a pointer into Rust VM memory, or another
 		// raw pointer (which would be the legacy Zeek::Val)
-		uint32_t as_offset;
 		void* as_ptr;
+		void* as_legacy;
 	} payload;
 };
 ```
@@ -115,9 +115,34 @@ This could be made more efficient with "tenuring" ie if an object sticks around,
 
 But, we could also have a "scratch" arena (eden) and a "persistent" (survivor) heap. In order to make the scratch space last longer than for this packet, it must get promoted. Promotions are handled by the VM when necessary, for example when adding to a vector in persistent memory. Everything in the scratch arena gets deleted after each packet. Allocation is simply bumping the `next` pointer (a bump allocator).
 
-The bump allocator needs a special consideration: If a Zeek value is in the scratch space, and that counts as a reference, simply wiping the scratch space would leak memory. Instead, it should keep references to any legacy `Val*` used. This would be done with a finalizer list. Before wiping the `next` pointer, we would run through each element of that list and unref it, so that the C++ code can wipe it if it is unreferenced. We need to scan each aggregate type again, since it can be written in the background. The finalizer list, therefore, would hold pointers to all complex types in the scratch space.
+There is a decent crate for this in Rust ([bumpalo](https://github.com/fitzgen/bumpalo)) which we could probably use well. One consideration here is that the internal Rust representation would be:
 
-Any persistent objects, then, are similar to managed values: they get refcounted just as before.
+```
+Rc<RefCell<Vec<ZVal>>>
+```
+
+That is, a reference counted, internally-mutable, vector of `ZVal`. When using the bump allocator, it doesn't call every `Drop` method, so we would need to keep the "complex" objects (ie anything represented by a pointer) and manually drop them. That means we don't get the full benefit of the arena, but we get the benefit of not managing memory ourselves, which is a fair tradeoff.
+
+## Another option: Offsets
+
+We could structure the `ZVal` such that pointers back into rust space are purely an offset:
+
+```
+struct ZVal {
+	union {
+		// ...
+		uint64_t as_offset;
+	} payload;
+};
+```
+
+Thus, any object is just an offset in some space in memory. We would determine from the flags whether it's persistent memory or scratch memory.
+
+But, this makes us manage our own arenas. It also means that we're rewriting a lot of infrastructure just for refcounting. We can use built-in mechanisms for this, and use the language to better help us. That's why the proposal used pointers, not offsets.
+
+## Object Representation
+
+Throughout this document so far, the scratch and persistent spaces have been pointers into two different spaces. This is useful as a model, but in reality, it might be a bit different. These are two *conceptual* spaces, but they really could be 
 
 ## Getting values
 
