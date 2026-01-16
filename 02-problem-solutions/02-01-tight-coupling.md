@@ -94,7 +94,8 @@ This creates a builder that we can set fields with:
 void vm_set_record_field(RecordBuilder* builder, std::size_t idx, ZVal val);
 ```
 
-> NOTE: One issue in Zeek right now is the reliance on indices (ie the std::size_t idx) when making record values. I believe we can solve this by creating a "layout" at startup. However, that can be done regardless of backend, so for this, I will continue with this structure.
+> [!NOTE]
+> One issue in Zeek right now is the reliance on indices (ie the std::size_t idx) when making record values. I believe we can solve this by creating a "layout" at startup. However, that can be done regardless of backend, so for this, I will continue with this structure.
 
 Then, when we are done, we "finish" the builder, invalidating the pointer, and returning the `ZVal` for what we just created:
 
@@ -106,12 +107,62 @@ Each of these functions are implemented in Rust. It is the interpreter's concern
 
 For the string, the value can be simple: since strings are often immutable, just store the length and the raw string. This can be adapted accordingly. We may also choose to intern strings, or use symbols, or something else, but this is a simple case.
 
-However, cases that produce a builder need to be more complex. The most pressing concern is: what if they never call `vm_end_record`? Then we keep the value around forever in the arena, so it's a memory leak. Not good.
+However, cases that produce a builder need to be more complex. The most pressing concern is: what if they never call `vm_end_record`? Then we keep the value around forever in the arena, so it's a memory leak. Not good. One part of this solution is simple: create C++ wrappers which call `begin_record` on creation and `end_record` on destruction. But we should still handle this case, in case something falls through.
 
 The solution here can vary. One proposal is to just keep it around, bump the `next` of the linear memory, etc. But, at the end of the packet, run a compacting garbage collector to gather any unreferenced values. We would store the refcount somewhere in the value.
 
 This could be made more efficient with "tenuring" ie if an object sticks around, move it to another space that is less likely to need collection.
 
-But, we could also have a "scratch" arena (eden) and a "persistent" (survivor) arena. In order to make the scratch space last longer than for this packet, it must get promoted. Promotions are handled by the VM when necessary, for example when adding to a vector in persistent memory. Everything in the scratch arena gets deleted after each packet. Allocation is simply bumping the `next` pointer (a bump allocator).
+But, we could also have a "scratch" arena (eden) and a "persistent" (survivor) heap. In order to make the scratch space last longer than for this packet, it must get promoted. Promotions are handled by the VM when necessary, for example when adding to a vector in persistent memory. Everything in the scratch arena gets deleted after each packet. Allocation is simply bumping the `next` pointer (a bump allocator).
+
+The bump allocator needs a special consideration: If a Zeek value is in the scratch space, and that counts as a reference, simply wiping the scratch space would leak memory. Instead, it should keep references to any legacy `Val*` used. This would be done with a finalizer list. Before wiping the `next` pointer, we would run through each element of that list and unref it, so that the C++ code can wipe it if it is unreferenced. We need to scan each aggregate type again, since it can be written in the background. The finalizer list, therefore, would hold pointers to all complex types in the scratch space.
 
 Any persistent objects, then, are similar to managed values: they get refcounted just as before.
+
+## Getting values
+
+We also have to get values! The primary case here is when calling a BiF, where we must translate the script-level `Val` into something the C++ core can handle more easily. For this, we would simply have a similar API to the builder.
+
+There will be more on this in the future, since the primary use here is with BiFs.
+
+## Generations
+
+When using the scratch space, we have to consider that some part of the system may access something which is invalid. Imagine it keeps around a pointer to offset 100 in a `ZVal` in scratch space. The packet ends, so that points to nothing. Then, a new packet arrives, and we pass that `ZVal` in. There is not a good mechanism to determine that `ZVal` is old, so it would likely crash or corrupt something.
+
+We should not fix this as it is a bug, but we can prevent this bug from affecting the system. There are two possibilities: We have extra space in `ZVal`, so we could store a 32-bit offset and 32-bit generation. Or, we can use the `extra` space to store a generation number. Each access of a `ZVal` would check to ensure the generation number is the same as the current generation. This is purely to avoid bugs, but an important distinction.
+
+## Resizing
+
+Part of the worry with the arena space is resizing. In the current proposal, if you push an element to a vector, it must check if it's at the end of the scratch space. If not, there might be a `ZVal` directly after the vector, so we must copy the vector to the end!
+
+There are a few options:
+
+1) Do nothing. This copying mechanism is fine. We might hit trouble with the "pass by reference" nature of a vector.
+2) Vectors can add a "link" that tells you where to keep looking, or an end delimeter if it's done. But, then we lose advantages of contiguous memory.
+3) Oversizing, so vectors have a capacity and get resized.
+
+Because it's similar to C++ `std::vector`, I would vote for 3. But, the other 2 options are worth considering, especially if we consider that adding to a vector multiple times would still be fast if it's still at the end of the arena.
+
+Note that 1 can be combined with oversizing, since we don't need to clone if it's at the end. We just tell it to grab more memory.
+
+## Moving to persistent memory
+
+When an object is assigned from the scratch arena (like a local variable or a temporary) to the persistent space (like a table or `connection` record), it will get *deep copied*. This is slow and potentially error prone (what if it's self-referential or has many `Val*`? How do reference values get counted?).
+
+Thus, we should likely make some APIs available to write to persistent space from the C++ engine, rather than scratch, but use them sparingly (like the `connection` record).
+
+There is also a whole class of optimizations that could help here. If we see adding an element to a persistent vector, we can simply construct it in-place in persistent memory. These would likely be specialized opcodes.
+
+# Proposal
+
+So, in case it got lost, the main problem here is:
+
+Scripting is deeply coupled with Zeek. We create `Val*` pointers with no intermediate function, gather facts, assign values in them, then shove them off into scriptland. Since the core thinks in `Val*` pointers, it often creates tension when implementing features, analyzers, or core components.
+
+The proposed solution:
+
+1) Move to Rust. This way, any interaction with values must be through a boundary (function calls, etc.) rather than creating `Val` objects directly.
+2) Switch the memory model to distinguish between "scratch" and "persistent" space, where the core can consider whether the values must be temporary or persistent.
+3) Create simple ways for the core to build up values within the interpreter and retrieve values.
+
+This way, we have a clear barrier between the values that a script handles and the values that the core handles. 
