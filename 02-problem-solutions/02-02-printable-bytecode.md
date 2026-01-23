@@ -12,6 +12,8 @@ enum Constant {
   Count(u64),
   String(String),
   Vector(Vec<u32>),
+  PrimitiveType(TypeTag), // not sure how these will look
+  AggregateType(u32),
   // Function pointers and types would be constants too!!
 }
 ```
@@ -26,7 +28,7 @@ For example, here is how a vector with integer elements `1`, `2`, and `3` might 
 +--------+-------+-------------------------------------+
 | offset | bytes | description                         |
 +--------+-------+-------------------------------------+
-| 0      | 9     | Vector type tag                     |
+| 0      | 3     | Vector type tag                     |
 | 1..4   | 21    | element type index (const index 21) |
 | 5..8   | 3     | length                              |
 | 9..12  | 24    | element 0 (const index 24)          |
@@ -37,13 +39,13 @@ For example, here is how a vector with integer elements `1`, `2`, and `3` might 
 | 22     | 0     | 0 describes it as primitive         |
 | 23     | 1     | `int` type tag                      |
 +--------+-------+-------------------------------------+
-| 24     | 1     | `int` type tag                      |
+| 24     | 0     | `int` type tag                      |
 | 25..28 | 1     | `int` value of `1`                  |
 +--------+-------+-------------------------------------+
-| 29     | 1     | `int` type tag                      |
+| 29     | 0     | `int` type tag                      |
 | 30..33 | 2     | `int` value of `2`                  |
 +--------+-------+-------------------------------------+
-| 34     | 1     | `int` type tag                      |
+| 34     | 0     | `int` type tag                      |
 | 35..38 | 3     | `int` value of `3`                  |
 +--------+-------+-------------------------------------+
 ```
@@ -111,11 +113,8 @@ struct Bytecode {
   consts: Vec<Constant>,
   instrs: Vec<Instruction>,
   exports: Vec<Export>,
-  // Importantly, we will probably need a mapping of instruction index to
-  // "span" for debug info, which is printed if given a debug option.
-  // The u64 here is a placeholder. This will likely hold a file ID and
-  // other information.
-  spans: Vec<(u32, u64)>,
+  // More on this later!
+  debug_info: Option<DebugInfo>,
 }
 ```
 
