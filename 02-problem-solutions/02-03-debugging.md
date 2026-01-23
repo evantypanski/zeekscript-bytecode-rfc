@@ -8,12 +8,12 @@ Recently, the Zeek team [(re)discovered a script debugger](https://github.com/ze
 
 First, the bytecode will already have source locations in the printable form (I will assume it is present, the debug information will be optional). We will now harden this proposal.
 
-The bytecode structure included:
+The bytecode structure included a codeblock with:
 
 ```
-struct Bytecode {
+struct CodeBlock {
   // ...
-  debug_info: Option<DebugInfo>
+  debug_info: Option<DebugInfo>,
 }
 ```
 
@@ -34,7 +34,7 @@ Then, a separate `DebugInfo` struct will correlate instructions to their spans:
 struct DebugInfo {
   // For now, one Bytecode is one DebugInfo. This may change!
   file: String,
-  // This is 1:1 mapped with Bytecode::instrs
+  // This is 1:1 mapped with CodeBlock::instrs
   spans: Vec<Span>,
   // Keep some information on locals, so that we can map a name to its frame
   // slot. This will store a name, slot, and span, most likely.

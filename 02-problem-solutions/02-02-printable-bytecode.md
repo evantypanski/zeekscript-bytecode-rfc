@@ -109,12 +109,18 @@ struct Export {
 The bytecode itself would be extremely simple. Imagine the Rust struct as:
 
 ```
+struct CodeBlock {
+  name: String, // Function name
+  frame_slot_count: u32, // Potentially needed
+  instrs: Vec<Instruction>, // This function's body
+  consts: Vec<Constant>, // Each function has its own constant pool for now
+  debug_info: Option<DebugInfo>, // More on this later!
+}
+
 struct Bytecode {
-  consts: Vec<Constant>,
-  instrs: Vec<Instruction>,
+  // We potentially need to point to a code block for top-level statements, too
+  blocks: Vec<CodeBlock>,
   exports: Vec<Export>,
-  // More on this later!
-  debug_info: Option<DebugInfo>,
 }
 ```
 
