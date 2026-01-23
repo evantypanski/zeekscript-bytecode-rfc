@@ -16,20 +16,44 @@ enum Constant {
 }
 ```
 
-When it is possible to store something in a simple form, the constant pool will inline. For example, constant entry 0 may just be an integer with value 2. Simple.
+On-disk, each constant would start with its type, then proceed to some number of bytes of data depending on the type.
 
-Complex types (like vector above) will contain a vector of indices. Since it's constant, we can define a layout, like the number of elements followed by the index of each other value included in the vector:
+For example, here is how a vector with integer elements `1`, `2`, and `3` might look (for demonstration, integer widths are 4 bytes):
 
 ```
-6123456
++------------------------------------------------------+
+|                  Constant Pool                       |
++--------+-------+-------------------------------------+
+| offset | bytes | description                         |
++--------+-------+-------------------------------------+
+| 0      | 9     | Vector type tag                     |
+| 1..4   | 21    | element type index (const index 21) |
+| 5..8   | 3     | length                              |
+| 9..12  | 24    | element 0 (const index 24)          |
+| 13..16 | 29    | element 1 (const index 29)          |
+| 17..20 | 34    | element 2 (const index 34)          |
++--------+-------+-------------------------------------+
+| 21     | 4     | `type` type tag                     |
+| 22     | 0     | 0 describes it as primitive         |
+| 23     | 1     | `int` type tag                      |
++--------+-------+-------------------------------------+
+| 24     | 1     | `int` type tag                      |
+| 25..28 | 1     | `int` value of `1`                  |
++--------+-------+-------------------------------------+
+| 29     | 1     | `int` type tag                      |
+| 30..33 | 2     | `int` value of `2`                  |
++--------+-------+-------------------------------------+
+| 34     | 1     | `int` type tag                      |
+| 35..38 | 3     | `int` value of `3`                  |
++--------+-------+-------------------------------------+
 ```
-
-This would be a vector of size `6` and whose elements are the constants at index `1`, `2`, ..., `6`. This won't be ASCII, it'll just be bytes in the constant pool.
 
 > [!NOTE]
 > We can define the constant pool layout however we want. This is just an example.
 
 Then, we just have instructions to access a particular constant. We can convert this constant into `ZVal` easily.
+
+For this, cycles will not be allowed. This simplifies the constant pool substantially.
 
 ## Functions
 
@@ -52,12 +76,31 @@ This means that functions are just any other global, just with a function type. 
 
 > [!NOTE]
 > Since we look it up in a hash map, it could be slow. Once we run it once, we can cache where it lives in memory. This is called [inline caching](https://en.wikipedia.org/wiki/Inline_caching).
+>
+> Or, since these are constants, we can resolve before ever running the program.
 
 ## Exports
 
 A script may export many things. We need a separate section that describes which identifiers get exported and what their values are.
 
-First, the value is defined in the constant pool. Then, we add an entry to the exports list, which maps a global name to the index into the constant pool. Then, the VM will register all of the exported names into persistent memory.
+First, the value is defined in the constant pool. Then, we add an entry to the exports list, which maps a global name to the index into the constant pool. Then, the VM will register all of the exported names into persistent memory (likely when loaded).
+
+Since we will need to distinguish between what is getting exported, this could look like:
+
+```
+enum ExportKind {
+  Value(ConstIdx), // Just a value in the constant table
+  Function(ConstIdx),
+  GlobalValue(ConstIdx),
+  Type(ConstIdx),
+};
+
+// Each export is defined by this very compact type:
+struct Export {
+  name: String,
+  kind: ExportKind,
+};
+```
 
 # Proposal
 
@@ -67,11 +110,13 @@ The bytecode itself would be extremely simple. Imagine the Rust struct as:
 struct Bytecode {
   consts: Vec<Constant>,
   instrs: Vec<Instruction>,
-  exports: Vec<(String, ConstIdx)>,
+  exports: Vec<Export>,
   // Importantly, we will probably need a mapping of instruction index to
   // "span" for debug info, which is printed if given a debug option.
+  // The u64 here is a placeholder. This will likely hold a file ID and
+  // other information.
   spans: Vec<(u32, u64)>,
 }
 ```
 
-Then, the constants are all defined entirely within the file and read into memory as `Constant`s. Then, these get converted into `ZVal` with some resolution step. Instructions will all point to frame slots (which get populated elsewhere) or constants, so everything is self-contained.
+Then, the constants are all defined entirely within the file and read into memory as `Constant`s. Then, these get converted into `ZVal` with some resolution step (or, we convert them lazily and cache the result!). Instructions will all point to frame slots (which get populated elsewhere) or constants, so everything is self-contained.
