@@ -61,6 +61,101 @@ Second, we could use the tree sitter parser that already exists. The downside he
 
 To get started, it's likely easiest to stick with the current approach, then hack in some hooks to get what we need. In the future, we should visit rewriting the parser, or just making a new version of the language (more on that later).
 
+## Bytecode Structure
+
+The bytecode is primarily a serialized version of ZAM. In order to serialize ZAM, some changes are necessary.
+
+1) Constants must be serialized in a constant pool, not referred to by a pointer.
+2) Exports must be serialized with their name in the bytecode.
+3) Any `@load` must be serialized, with lookups done at runtime.
+
+With that, here is the proposed complete structure:
+
+```mermaid
+
+block-beta
+columns 1
+  block:bytecode
+    columns 3
+    myfile(["my_file.zeek"]):3
+    Header:3
+    block:zeekinit
+        columns 1
+        zeek_init(["<code> event zeek_init()</code>"])
+        funcheader["Function Header"]
+        instrs["Instructions"]
+        debug["(optional) Debug info"]
+    end
+    block:newconn
+        columns 1
+        new_connection(["<code> event new_connection(c: connection)</code>"])
+        funcheaderconn["Function Header"]
+        instrsconn["Instructions"]
+        debugconn["(optional) Debug info"]
+    end
+    block:hook
+        columns 1
+        myhook(["<code> hook myhook(c: connection)</code>"])
+        funcheaderhook["Function Header"]
+        instrshook["Instructions"]
+        debughook["(optional) Debug info"]
+    end
+
+    consts["Constant map"]:3
+
+    block
+        columns 1
+        load1(["<code>@load base/frameworks/cluster</code>"])
+        load1num["constant map idx 2"]
+    end
+    block
+        columns 1
+        load2(["<code>@load base/frameworks/storage/async</code>"])
+        load2num["constant map idx 3"]
+    end
+    block
+        columns 1
+        load3(["<code>@load base/frameworks/storage/sync</code>"])
+        load3num["constant map idx 4"]
+    end
+
+    block:export1
+        columns 1
+        count(["<code>export { const my_count = 1; }</code>"])
+        countname["my_count"]
+        countnum["constant map idx 5"]
+        countmodule["module constant map idx 8"]
+    end
+    block:export2
+        columns 1
+        ports(["<code>export { const ports = {123/tcp}; }"])
+        portsname["ports"]
+        portnum["constant map idx 6"]
+        portmodule["module constant map idx 9"]
+    end
+    block:export3
+        columns 1
+        type(["<code>export { type Info: record { a: count; }; }</code>"])
+        typename["Info"]
+        typenum["constant map idx 7"]
+        typemodule["module constant map idx 10"]
+    end
+  end
+```
+
+> [!NOTE]
+> The circles contain the code, they are not in the actual bytecode. They are for reference. Also, the constant indexes will be array indices, but here they are dummy values.
+
+The headers include information like:
+
+1) Offsets for each section
+2) Filename
+
+Function headers are similar. They may need:
+
+1) Function name
+2) Number of frame slots
+
 ## Execution
 
-Now, assume that we have a compiler which compiles Zeek scripts down into Zeek bytecode (`.zbc`) files (which is a big ask!). 
+Now, assume that we have a compiler which compiles Zeek scripts down into Zeek bytecode (`.zbc`) files (which is a big ask!).

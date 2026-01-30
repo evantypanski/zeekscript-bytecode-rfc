@@ -57,6 +57,32 @@ Then, we just have instructions to access a particular constant. We can convert 
 
 For this, cycles will not be allowed. This simplifies the constant pool substantially.
 
+### Attributes
+
+The above example ignores attributes, but attributes should be fairly straightforward. The general structure above assumes a bytecode like:
+
+```
+<type tag><value>
+```
+
+This will more accurately, with attributes, be:
+
+```
+<type tag><num attributes><attribute1><attribute2><value>
+```
+
+Where each `attribute1` etc. will have an `attribute tag` followed by an optional value. This optional value will be an index into the constant map.
+
+We may also choose to serialize attributes themselves in the constant map as well! They would just have their own type tag, an attribute tag, followed by an optional constant index. In its current form this would not buy us anything but generality, which may be worth it in and of itself.
+
+### `redef`
+
+One caveat here is that the constant map *can* be changed by other scripts! Thus, we have to eagerly load `&redef` constants and `option`s (meaning we put them into memory with their maleable value in persistent space). This will require a scan of the constant map on load for any values marked `&redef`.
+
+The downside here is that we cannot guarantee constants in memory are constant, since we have to be able to change them with `redef` or the configuration framework. It would be a bug to let the user reassign a constant value, so it will be consistently important to only allow modifying these values in very particular scenarios.
+
+In order to get the correct value, the VM must be able to find a loaded constant if there is one, otherwise load it. For `&redef` and `option`, since the value is eagerly loaded, it will always use the pre-loaded value.
+
 ## Functions
 
 Functions are just special globals. Say we want to load the function `test()` from Zeekscript, like:
@@ -113,15 +139,16 @@ struct CodeBlock {
   name: String, // Function name
   frame_slot_count: u32, // Potentially needed
   instrs: Vec<Instruction>, // This function's body
-  consts: Vec<Constant>, // Each function has its own constant pool for now
   debug_info: Option<DebugInfo>, // More on this later!
 }
 
 struct Bytecode {
   // We potentially need to point to a code block for top-level statements, too
   blocks: Vec<CodeBlock>,
+  consts: Vec<Constant>, // We can de-dup constants used in multiple functions!
+  loads: Vec<ConstIdx>, // Each load is just a constant string
   exports: Vec<Export>,
 }
 ```
 
-Then, the constants are all defined entirely within the file and read into memory as `Constant`s. Then, these get converted into `ZVal` with some resolution step (or, we convert them lazily and cache the result!). Instructions will all point to frame slots (which get populated elsewhere) or constants, so everything is self-contained.
+Then, the constants are all defined entirely within the file and read into memory as `Constant`s. These get converted into `ZVal` with some resolution step (or, we convert them lazily and cache the result, minus `redef`able ones!). Instructions will all point to frame slots (which get populated elsewhere) or constants, so everything is self-contained.
