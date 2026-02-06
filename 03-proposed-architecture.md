@@ -158,4 +158,71 @@ Function headers are similar. They may need:
 
 ## Execution
 
-Now, assume that we have a compiler which compiles Zeek scripts down into Zeek bytecode (`.zbc`) files (which is a big ask!).
+Now, assume that we have a compiler which compiles Zeek scripts down into Zeek bytecode (`.zbc`) files (which is a big ask!). How do we execute a bytecode file? How does it execute alongside other script files?
+
+We will consider two cases: when *all* code is (or can be compiled to) bytecode, and when a subset of code must remain with the old interpreter.
+
+### All Bytecode
+
+This is the end goal. When shipping Zeek, it is shipped with `.zbc` files for its core functionality. Users put `.zbc` files anywhere that script files are expected. These load and act exactly the same as Zeek scripts, but they must be compiled with any changes.
+
+Note that we can still easily allow `.zeek` files: just do what ZAM currently does. We can compile the Zeekscripts down into `.zbc` files, then execute them, just as easily as in separate steps. We may keep these in memory or keep the `.zbc` files in a temporary directory, it really doesn't matter. Regardless, once we can reliably compile Zeekscripts to `.zbc` files, the only thing we have to worry about is bytecode execution.
+
+So: what does the flow through Zeek look like when everything is a bytecode? Here's a flow chart!
+
+```mermaid
+flowchart TD
+    Start{Start}
+    init[Parse options, etc.]
+    compile[Compile .zeek files]
+    init-vm[Initialize VM]
+    load[Load bytecode files]
+    byte-init[Initialize bytecodes zeek_init, etc.]
+    loop[Main loop]
+
+    Start --> init
+    init -- "For each .zeek file" --> compile
+    compile --> init-vm
+    init-vm --> load
+    load --> byte-init
+    byte-init --> loop
+```
+
+The only real change is that we must compile scripts before any `zeek_init` (but after plugin loads) and initialize the VM. The changes are pretty minimal, it's mostly *where* it happens. For example, the initial event drain for initialization happens within the VM, not within the core. But, other than that, the actual differences should be relatively subtle.
+
+The main loop will look almost exactly the same as it does now. The only difference is, again, *where* the work happens. When draining the event queue, work does not happen in the interpreter, it happens in the Rust VM. When enqueueing events, that goes through the Rust VM. The flow will be almost exactly the same.
+
+## Transition Period
+
+However, there is a sad reality here: there will be a transition period where we cannot compile *all* scripts to bytecode. For this period, we can accept innefficiencies: more copies, more conversions between new values and old values. The goal is to have it work, but we will not run this in production anywhere.
+
+For this, the Rust VM will start execution no matter if the function is only executable with the old interpreter. Since `ZVal` can hold "legacy" value pointers, we can still refer to `ZVal` within the Rust VM. However, the Rust VM will not know how to modify a legacy value, so it will always convert those to native `ZVal` whenever they are used. This is the "tax" you pay for calling legacy functions.
+
+Thus, the call from the new VM to the legacy interpreter will look like:
+
+1) Find the corresponding function pointer
+2) Determine that it is legacy
+3) Calculate any arguments, then convert them to legacy values
+4) Use a dedicated shim to call legacy functions and get its result as a legacy value
+5) Update any `ZVal` that would be updated by converting legacy values back into `ZVal`
+6) Return the `ZVal` (which is a wrapper around the legacy value)
+
+Step 5 is the interesting one here: if we pass an aggregate type, the legacy script may change the value! If it does that, then we later have to reflect those changes in the `ZVal`, even if it wasn't a legacy value when it was called.
+
+This means that we may convert huge structures back and forth from `ZVal`, which will be horrible for performance. However, the goal here is *correctness*, not speed. Speed will come when the *new backend* is actually the entire execution engine of Zeekscript, not some alternative that gets called sometimes.
+
+We may also have the alternative: a legacy script function calls a function that was *only* provided in a bytecode file. One option is to basically disallow this, but that hurts flexibility. But the proposal here would be quite similar:
+
+1) Find the corresponding function pointer
+2) Determine that it is bytecode
+3) Calculate any arguments, then wrap them in `ZVal` as legacy pointers
+4) Use a dedicated shim to call the bytecode function from Zeek's core
+5) Update any legacy pointers that would be updated by converting `ZVal` back into legacy values
+6) Convert the return value into legacy value and return that
+
+One important point here is that this scenario will only happen when we've already called a legacy function from the bytecode. Thus, we are likely doing *two* conversions of values into legacy values, then back to `ZVal`. Again, this will be a performance killer in the short term.
+
+> [!NOTE]
+> The alternative to this is not much better: the Rust VM gets full understanding of working with Zeek script values, then can easily fall back on that. Handling the FFI boundary with pointers like this would not be particularly easy, but potentially doable. A primary concern, however, is this keeps us stuck to the old value semantics. Since the transition is explicitly part of the development phase, and won't be used in production code, we can architect it to treat those cases as edge cases. We do not need to engrain current value semantics into the new value design, they simply convert when needed using helpers.
+
+Thus, we have a new model for how any Zeek scripts are called and handled.
