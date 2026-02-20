@@ -1,27 +1,39 @@
 # Problem 9: Events
 
-Events are a bit tricky. Ideally, they are the first part to switch to `ZVal`-focused handling. But, we have to be careful about events which need extra consideration, like `schedule`. Furthermore, we may not guarantee that each invocation of `Drain` completely empties the queue, as it only runs two rounds!
+Events are currently handled as an event queue within C++. Various analyzers shove events into this queue, then the queue gets periodically drained. This is the case even for "meta" events: `zeek_init` is just an event that gets added to the queue, then later drained. It's just that the drain is triggered within setup, and has some special properties (ie with initialization errors).
 
-Events are also a scripting concern, so the interpreter will handle them. The interpreter will know where each event is and hold the event queue.
+This presents two problems:
 
-## The queue drain problem
+1) Events are script-level constructs. This means that an event handler lives in the script layer, and its arguments are script values.
+2) The core must retrieve the events it wants to raise somehow.
 
-While previously, the scratch space was said to be destroyed "after each packet," this logic needs revisitted. The first point is that we may need a `ZVal` to live longer if its event has not been handled yet. For that, we will need a special handler after draining the event queue.
+## Where is the event queue?
 
-For this, we will do one final round: Gather up all `ZVal`s that are used in pending events (without dispatching!) and promote them to persistent space.
+To solve 1, we simply move the event manager to the VM. The core then simply asks the VM to enqueue an event (exactly as it does now) and drain the event queue (again, exactly as it does now). In practice, all this means is that the new VM holds the keys, and the core can interact in almost exactly the same way.
 
-## Scheduled events
+Of course, the values that get enqueued as arguments should now be created using the new value API, thus creating `ZVal`, so that the event can be entirely handled within Rust.
 
-Some events can be scheduled:
+So the solution to 1 is simple. Move the event queue to the script VM.
+
+## How to get events?
+
+The second problem has a simple solution. The core of it is that the C++ core needs to understand what event to enqueue. The Rust VM is the one that knows where events are. So each time an event is enqueued, we can just ask the Rust VM to look up an event by name, provide an optional result, then enqueue it if it is available. This could just be one enqueue call.
+
+Zeek's core currently has `.bif` files (like `event.bif`) which produce the event definitions. These definitions are used throughout the core. In order to make minimal changes, this should be targetted. Then we keep exactly the same `.bif` files and event registration. For context, the generated code for an event defined in the `event.bif` file looks like:
 
 ```
-schedule 30sec { myevent(x, y, z) };
+	::zeek_init = zeek::event_registry->Register("zeek_init");
 ```
 
-In this case, we must keep `x`, `y`, and `z` in persistent space. We can determine this from the runtime: if there is code scheduled (like so) or async code, then promote any values to persistent space.
+We can simply keep this, then hijack `event_registry` just as we proposed for the event queue. Eventing is a VM concern.
 
-# Proposal
+Note that the event pointer will not apply. Here is the definition for `zeek_init`:
 
-The proposal here is simple: after the event queue is drained, it must promote any needed events in scratch space to persistent space. Then, scheduled events have all values promoted immediately.
+```
+zeek::EventHandlerPtr zeek_init; 
+```
 
-The event queue will move to the interpreter. Event handlers are simply pointers to values. This will be a `ZVal`. These `ZVal`, as discussed earlier, may point back into logacy script pointers, which invoke "legacy" events.
+This means we must change `EventHandler`. After this, it will be an opaque handle into the VM, which it gets from the `Register` call. If a fallback is necessary, it can turn the event handler into either a Rust VM managed handler or a legacy handler, then choose based on that.
+
+> [!NOTE]
+> While eventing is a VM concern (in Rust), *registering* events is a core concern. The VM does not (and will not) have a static list of events. The core may, but doesn't have to (since it can request based on event names from the VM). Anything related to events will be a VM concern except registering them. This extends to event groups, disabling events, marking them as used, and more.
