@@ -15,7 +15,7 @@ But, in its current form, we simply don't have the resources to fix these issues
 1) Changing this behavior will break existing code with no good deprecation.
 2) The internal script execution is too frustrating to work with, so we do not want to spend significant time changing or adding features.
 
-The first is a fundamental problem: we simply cannot leave existing code, that has worked for a decade, in a state that it cannot function under any circumstance. There are too many existing codebases written using this engine to completely rip some parts up in one release, even with deprecations. The solution here would be Zeek script 2.0, or another language.
+The first is a fundamental problem: we simply cannot leave existing code, that has worked for a decade, in a state that it cannot function. There are too many existing codebases written using this engine to completely rip some parts up in one release, even with deprecations. The solution here would be Zeek script 2.0, or another language.
 
 So, we must consider that Zeek scripting, as a language, has shortcomings that we should address in order to make the language better. This is a syntax and language design problem, which itself is interesting. But, we cannot address this in the current core. As-is, Zeek scripts are still executed with the tree walking interpreter. If we want to have a large batch of syntax and language updates, this should almost certainly be alongside existing syntax. We should have a system that enables both.
 
@@ -25,21 +25,21 @@ The second is completely solvable in its current state. As-is, the Zeek scriptin
 
 This is an impractical design for an interpreter for a few reasons, which I will not get into. The primary one is that it is slow (it uses virtual methods which require double-pointer indirection). The second is that it cannot be easily optimized with modern optimization techniques. The third is that it is hard to debug, as you end up being deeply nested in virtual function calls.
 
-The language itself is very tightly tied to its syntax.
+The language itself is very tightly tied to its syntax. In return, *values* are tightly coupled to scripting syntax. But values are used all over Zeek's core. We have a design problem where core components rely on script semantics, making it hard to change one without affecting the other.
 
 ## ZAM
 
-Because of this, the Zeek Abstract Machine (ZAM) was created. This is effectively a bytecode: instead of traversing a tree, we are walking through a linear list of instructions. Created values are simply "frame objects" stored on a per-function basis. *This works!* Not only that, this is the proper way for a modern scripting language to work internally.
+For optimization, the Zeek Abstract Machine (ZAM) was created. This is effectively a bytecode: instead of traversing a tree, we are walking through a linear list of instructions. Created values are simply "frame objects" stored on a per-function basis. *This works!* Not only that, this is the proper way for a modern scripting language to work internally.
 
 However, ZAM is much more of an optimization on existing infrastructure. There are a few points here worth mentioning:
 
-1) You cannot simply print ZAM as a binary, then load that. This would reduce parsing time (and initial startup), as well as potentially providing some intellectual property protection since you wouldn't need to ship Zeek script content.
-2) ZAM still falls back to Zeek scripting values for some complex values. This is a primary reason that it cannot be printed.
+1) You cannot simply serialize ZAM as a binary, then load that. This would reduce parsing time (and initial startup), as well as potentially providing some intellectual property protection since you wouldn't need to ship Zeek script content. This also would add flexibility, as anything that can make ZAM code can be loaded.
+2) ZAM still falls back to Zeek scripting values for some complex values. This is a primary reason that it cannot be serialized.
 3) ZAM relies on C++ memory management, which leads to segfaults or incorrect reference values if computed incorrectly.
 
 Thus, I believe ZAM is extremely useful as a bytecode layout which is capable of optimizations that we should leverage. We should, however, strive to make it better. Its instruction set can very well be left relatively the same, as well as many of the optimizations and a chunk of the internals.
 
-One extra issue that ZAM has is that the core Zeek team was relatively uninvolved with its creation and development. It seems problematic for one person who is not officially a maintainer to maintain what should be a core component of Zeek. Of course, we as maintainers should have a detailed understanding of all code in Zeek's core, but that has fallen behind.
+One extra issue that ZAM has is that it was developed largely in isolation. It seems problematic for an integral part of Zeek to be developed with such isolation. Of course, we as maintainers should have a detailed understanding of all code in Zeek's core, but that has fallen behind.
 
 ## Zeek's future considerations
 
@@ -55,9 +55,20 @@ Rewriting Zeek in Rust is a non-starter. But, we can write a new, core component
 
 Though, the biggest benefit is that Zeek's core is tightly coupled with its scripting language. This was, almost certainly, an advantage at one point. If there is no boundary between Zeek scripts and the core, you can directly manipulate the core to your liking! But, this has simply gotten too far. When making record values, the core Zeek code uses hard-coded integer offsets. We dynamically allocate values that get passed into the scripting layer. Creating the exact values used in the scripting layer means that any changes to the *core* change the *script* behavior.
 
-The interpreter can be decoupled. In a hypothetical new world, the core can ask the interpreter to create a value, then if it needs to retrieve the values, it asks the interpreter. This means that the *interpreter* is uniquely in charge of its domain. The boundary here is important to get right, so that we do not have unnecessary marshalling (ie converting between Zeek scripting and C++ values). I believe this problem is surmountable.
+Tight coupling is also exactly why initiatives like ZeekJS or Spicy have troubles. Spicy cannot use Zeek's value model without directly including Zeek (like how Binpac does with regular expressions). ZeekJS requires some knowledge about how Zeek scripting works and has performance overhead for certain constructs (though I am not very knowledgable about the limitations here). These come about because no external system can reasonably reuse Zeek's value model, so if it creates values, it must have complexities integrating the two.
 
+The interpreter can be decoupled. In a hypothetical new world, the core can ask the interpreter to create a value, then if it needs to retrieve the values, it asks the interpreter. This means that the *interpreter* is uniquely in charge of its domain. The boundary here is important to get right, so that we do not have unnecessary marshalling (ie converting between Zeek scripting and C++ values). I believe this problem is surmountable.
 
 Now, the interpreter will have a boundary which Zeek's core interacts with. We can change the core without the interpreter and vice-versa. The *hope* is that we can feel more comfortable with more changes, since we can just adapt that boundary if something in the core conflicts with the "old way."
 
 If we write the interpreter in Rust, then this boundary *has* to be carefully considered. We are forced to design this properly. We can see exactly where and when the boundary is an issue and correct it. We can think about each side as its own component. The interpreter must, then, stand alone, which makes it easier to test and verify.
+
+# tl;dr
+
+In summary:
+
+**What are the goals?** The primary goal is to redefine Zeek's value model in order to decouple it from Zeek's core. The core may still create and use values, but it no longer does this via value pointers. Doing so, we have an opportunity to move fully away from Zeek's tree-walking interpreter. We can also use this as an opportunity to introduce Rust where it makes sense (language development in Rust is very nice!).
+
+**What isn't the goal?** Optimizations are not a primary concern here. While I expect that simply moving the value model away from Zeek's current values would produce speedup, and fully transitioning to a bytecode would, optimizations are squarely not the chief concern.
+
+**Why not X language?** The chief concern, again, is Zeek's value model. This proposal is largely for a bytecode because there are thousands of Zeekscripts. We cannot break these, or deprecate them, reasonably. But we also don't want to keep the old interpreter or values around. A bytecode would let us keep Zeekscript as a language, but also move the value model to something better. From there, we may choose to create values using *whatever language we want*. It would be far simpler.
