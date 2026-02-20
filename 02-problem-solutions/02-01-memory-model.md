@@ -35,7 +35,50 @@ struct ZVal {
 };
 ```
 
-This will be a 16-byte struct and can describe *all* Zeek values, legacy or not, within the interpreter and Zeek's core. Complex values will use `as_offset` in order to point to an `Arena`. This arena is where all values get stored, except for legacy `Val`.
+This will be a 16-byte struct and can describe *all* Zeek values, legacy or not, within the interpreter and Zeek's core. Complex values remain refcounted, just in Rust world. Ref and unref move from the `Val*` object itself (or `Obj`) into a function that would take any `ZVal` and apply the proper ref/unref semantics.
+
+Creating values is now the concern of the VM. This VM will provide functions which can gather data about the values, like its type, or members within the struct. You would "build up" values to use within the Rust VM from C++, then access them as opaque values.
+
+Any value stored within the VM will have to be built. For this, we would create a C/C++ API which creates the complex values from simple structs. Some of these are easy, like a String can just take in an std::string:
+
+```
+ZVal vm_create_string(VM* vm, std::string s);
+```
+
+Others, however, will need "built." We do this with a builder:
+
+```
+RecordBuilder* vm_begin_record(VM* vm)
+```
+
+This creates a builder that we can set fields with:
+
+```
+void vm_set_record_field(RecordBuilder* builder, std::size_t idx, ZVal val);
+```
+
+> [!NOTE]
+> One issue in Zeek right now is the reliance on indices (ie the std::size_t idx) when making record values. I believe we can solve this by creating a "layout" at startup. However, that can be done regardless of backend, so for this, I will continue with this structure. It eases the transition if we simply have to translate one function call to another, rather than create layouts and use them in different ways than Zeek's core currently does.
+
+Then, when we are done, we "finish" the builder, invalidating the pointer, and returning the `ZVal` for what we just created:
+
+```
+ZVal vm_end_record(RecordBuilder* builder);
+```
+
+Each of these functions are implemented in Rust. It is the interpreter's concern *how* to build the object from various ZVals, it is the core's concern to place them in the right positions.
+
+For the string, the value can be simple: since strings are often immutable, just store the length and the raw string. This can be adapted accordingly. We may also choose to intern strings, or use symbols, or something else, but this is a simple case.
+
+However, cases that produce a builder need to be more complex. The most pressing concern is: what if they never call `vm_end_record`? The builder itself would leak data.
+
+The solution here cannot truly be generalized, it must be the caller's responsibility. Thankfully, we can create a simple solution for Zeek: RAII wrappers. Simply have the builder call `vm_end_record` on destruction, then the `ZVal` will end up with no references and get destroyed.
+
+### Alternative: Arena
+
+We can add another option here: an offset into some "arena" allocation which gets cleared on event drain. The benefit here is that we can clear it extremely quickly. However, we have to separate out a "persistent" space that would hold values which must remain between event handlers.
+
+Since this only helps short-lived aggregate types, the speedups are likely not worth the complexity. Regardless, the proposal is here:
 
 ```mermaid
 flowchart LR
@@ -76,46 +119,7 @@ flowchart LR
     Scratch -.->|Promote/Clone| Heap
 ```
 
-Any value stored within the arena will have to be built. For this, we would create a C++ API which creates the complex values from simple structs. Some of these are easy, like a String can just take in an std::string:
-
-```
-ZVal vm_create_string(VM* vm, std::string s);
-```
-
-Others, however, will need "built." We do this with a builder:
-
-```
-RecordBuilder* vm_begin_record(VM* vm)
-```
-
-This creates a builder that we can set fields with:
-
-```
-void vm_set_record_field(RecordBuilder* builder, std::size_t idx, ZVal val);
-```
-
-> [!NOTE]
-> One issue in Zeek right now is the reliance on indices (ie the std::size_t idx) when making record values. I believe we can solve this by creating a "layout" at startup. However, that can be done regardless of backend, so for this, I will continue with this structure.
-
-Then, when we are done, we "finish" the builder, invalidating the pointer, and returning the `ZVal` for what we just created:
-
-```
-ZVal vm_end_record(RecordBuilder* builder);
-```
-
-Each of these functions are implemented in Rust. It is the interpreter's concern *how* to build the object from various ZVals, it is the core's concern to place them in the right positions.
-
-For the string, the value can be simple: since strings are often immutable, just store the length and the raw string. This can be adapted accordingly. We may also choose to intern strings, or use symbols, or something else, but this is a simple case.
-
-However, cases that produce a builder need to be more complex. The most pressing concern is: what if they never call `vm_end_record`? Then we keep the value around forever in the arena, so it's a memory leak. Not good. One part of this solution is simple: create C++ wrappers which call `begin_record` on creation and `end_record` on destruction (RAII). But we should still handle this case, in case something falls through.
-
-We could also add an abort record, for if we have an error. This way we just don't commit the transaction and can overwrite it.
-
-The solution here can vary. One proposal is to just keep it around, bump the `next` of the linear memory, etc. But, at the end of the packet, run a compacting garbage collector to gather any unreferenced values. We would store the refcount somewhere in the value.
-
-This could be made more efficient with "tenuring" ie if an object sticks around, move it to another space that is less likely to need collection.
-
-But, we could also have a "scratch" arena (eden) and a "persistent" (survivor) heap. In order to make the scratch space last longer than for this packet, it must get promoted. Promotions are handled by the VM when necessary, for example when adding to a vector in persistent memory. Everything in the scratch arena gets deleted after each packet. Allocation is simply bumping the `next` pointer (a bump allocator).
+If a value is in arena space and needs to stick around beyond the current event drain, that would be done with a "scratch" arena (eden) and a "persistent" (survivor) heap. In order to make the scratch space last longer than for this packet, it must get promoted. Promotions are handled by the VM when necessary, for example when adding to a vector in persistent memory. Everything in the scratch arena gets deleted after each packet. Allocation is simply bumping the `next` pointer (a bump allocator).
 
 There is a decent crate for this in Rust ([bumpalo](https://github.com/fitzgen/bumpalo)) which we could probably use well. One consideration here is that the internal Rust representation could be:
 
@@ -142,8 +146,6 @@ This offset is just an index into a scratch arena.
 
 But, this makes us manage our own arenas. It also means that we're rewriting a lot of infrastructure just for refcounting. We can use built-in mechanisms for this, and use the language to better help us.
 
-The proposal here, then, would be to use *offsets* for the scratch arena, and direct pointers for the persistent memory. So the arena is a special arena that can simply be dropped in its entirety with no special consideration. The persistent space is just ref-counted Rust pointers.
-
 ## Object Representation
 
 Throughout this document so far, the scratch and persistent spaces have been pointers into two different spaces. This is useful as a model, but in reality, it might be a bit different. These are two *conceptual* spaces, but they really could be 
@@ -154,41 +156,6 @@ We also have to get values! The primary case here is when calling a BiF, where w
 
 There will be more on this in the future, since the primary use here is with BiFs.
 
-## Generations
-
-When using the scratch space, we have to consider that some part of the system may access something which is invalid. Imagine it keeps around a pointer to offset 100 in a `ZVal` in scratch space. The packet ends, so that points to nothing. Then, a new packet arrives, and we pass that `ZVal` in. There is not a good mechanism to determine that `ZVal` is old, so it would likely crash or corrupt something.
-
-We should not fix this as it is a bug, but we can prevent this bug from affecting the system. There are two possibilities: We have extra space in `ZVal`, so we could store a 32-bit offset and 32-bit generation. Or, we can use the `extra` space to store a generation number. Each access of a `ZVal` would check to ensure the generation number is the same as the current generation. This is purely to avoid bugs, but an important distinction.
-
-It could also be enabled only in debug builds.
-
-## Resizing
-
-Part of the worry with the arena space is resizing. In the current proposal, if you push an element to a vector, it must check if it's at the end of the scratch space. If not, there might be a `ZVal` directly after the vector, so we must copy the vector to the end!
-
-This is a problem if where you copied the vector *modifies* it. In Zeekscript, the vector would be passed by reference. So the modification would require rewriting all other pointers that pointed to that vector to point to a new one!
-
-There are a few options:
-
-1) Do nothing. This copying mechanism is fine. We might hit trouble with the "pass by reference" nature of a vector.
-2) Vectors can add a "link" that tells you where to keep looking, or an end delimeter if it's done. But, then we lose advantages of contiguous memory.
-3) Oversizing, so vectors have a capacity and get resized.
-4) Anything resizeable goes into persistent memory, even if it doesn't live beyond the current context.
-
-In this case, the proposal is actually 4: we would keep a vector in persistent memory, and anything else that may have to change position. That is, unless we can *prove* that it can live in scratch space with a certain size.
-
-Regardless, we will make both memory models: an arena model and a persistent model. One will use offsets into an arena, the other will use Rust's `Rc`.
-
-## Moving to persistent memory
-
-When an object is assigned from the scratch arena (like a local variable or a temporary) to the persistent space (like a table or `connection` record), it will get *deep copied*. This is slow and potentially error prone (what if it's self-referential or has many `Val*`? How do reference values get counted?).
-
-Thus, we should likely make some APIs available to write to persistent space from the C++ engine, rather than scratch, but use them sparingly (like the `connection` record).
-
-There is also a whole class of optimizations that could help here. If we see adding an element to a persistent vector, we can simply construct it in-place in persistent memory. These would likely be specialized opcodes.
-
-We can also "pre-tenure" a value if we know that it eventually goes into persistent memory. This is just a dataflow problem.
-
 # Proposal
 
 So, in case it got lost, the main problem here is:
@@ -198,7 +165,7 @@ Scripting is deeply coupled with Zeek. We create `Val*` pointers with no interme
 The proposed solution:
 
 1) Move to Rust. This way, any interaction with values must be through a boundary (function calls, etc.) rather than creating `Val` objects directly.
-2) Switch the memory model to distinguish between "scratch" and "persistent" space, where the core can consider whether the values must be temporary or persistent.
+2) Rust handles all values. If a value is stored within Zeek, it is the user's responsibility to ref/unref it. The VM will properly ref/unref by virtue of using `Rc`. In practice, this should entail changing all `Obj::Ref` and `Obj::Unref` with calls to the C wrappers, which in turn will call the relevant ref and unref function.
 3) Create simple ways for the core to build up values within the interpreter and retrieve values.
 
 This way, we have a clear barrier between the values that a script handles and the values that the core handles. 
