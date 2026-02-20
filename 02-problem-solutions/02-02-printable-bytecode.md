@@ -1,6 +1,6 @@
-# Problem 2: The bytecode should be printable
+# Problem 2: The bytecode should be serializable
 
-One issue with ZAM is that starting it up, you get a long phase of compiling the scripts down into ZAM. We need a better solution for this. To do this, the bytecode must be printable. This means that all values used within a given bytecode are in a constant pool. Furthermore, any function calls must get the address somehow.
+One issue with ZAM is that starting it up, you get a long phase of compiling the scripts down into ZAM. We need a better solution for this. To do this, the bytecode must be serializable. This means that all values used within a given bytecode are in a constant pool. Furthermore, any function calls must get the address somehow.
 
 ## Constant Pool
 
@@ -75,9 +75,17 @@ Where each `attribute1` etc. will have an `attribute tag` followed by an optiona
 
 We may also choose to serialize attributes themselves in the constant map as well! They would just have their own type tag, an attribute tag, followed by an optional constant index. In its current form this would not buy us anything but generality, which may be worth it in and of itself.
 
+### Arbitrary expressions
+
+The attributes have one caveat: values can just be expressions. Because of this, we also need some way to point into the bytecode and execute expressions, from the constant map. This means that the bytecode cannot simply be a list of functions, it also must contain other groups of instructions like attribute expressions. Then attributes would have an optional pointer into the bytecode's instructions.
+
+Thankfully, the instructions from the attribute will always live in the same place as the attribute itself. This means that we do not have to worry about file boundaries.
+
+Note that this same problem does not apply to functions. A function will have a lookup table, so we can always find it that way (more on that later). Theoretically a function could be stored in the constant map, but that would require a linker pass in order to find the correct offsets for each function. That is likely not worth it.
+
 ### `redef`
 
-One caveat here is that the constant map *can* be changed by other scripts! Thus, we have to eagerly load `&redef` constants and `option`s (meaning we put them into memory with their maleable value in persistent space). This will require a scan of the constant map on load for any values marked `&redef`.
+The constant map *can* be changed by other scripts! Thus, we have to eagerly load `&redef` constants and `option`s (meaning we put them into memory with their maleable value). This will require a scan of the constant map on load for any values marked `&redef`.
 
 The downside here is that we cannot guarantee constants in memory are constant, since we have to be able to change them with `redef` or the configuration framework. It would be a bug to let the user reassign a constant value, so it will be consistently important to only allow modifying these values in very particular scenarios.
 
@@ -91,21 +99,21 @@ Functions are just special globals. Say we want to load the function `test()` fr
 local x = test();
 ```
 
-Then, we would store a constant at slot 0 as the string `"test"`:
+The constant pool would have an entry for the function, say at index 0. It simply says it is a function with the function's name `"test"`:
 
 ```
 CONSTANTS:
   #0: String("test")
 ```
 
-And the VM would use an instruction to load this from persistent memory. This would be through a map lookup of global name to persistent memory address.
+The VM would use an instruction to load this from memory. This would be through a map lookup of global name to memory address. On load, we find the memory addresses from each function and store them in this map.
 
 This means that functions are just any other global, just with a function type. This same logic applies to anything from another script.
 
 > [!NOTE]
-> Since we look it up in a hash map, it could be slow. Once we run it once, we can cache where it lives in memory. This is called [inline caching](https://en.wikipedia.org/wiki/Inline_caching).
+> Since we look it up in a hash map, it could be slow. Once we run it once, we can cache where it lives in memory. This is called [inline caching](https://en.wikipedia.org/wiki/Inline_caching). Modify the instruction itself to use the known location of the function.
 >
-> Or, since these are constants, we can resolve before ever running the program.
+> Or, since these are constants, we can resolve before ever running the program. That would be like a linker pass.
 
 ## Exports
 
@@ -136,14 +144,15 @@ The bytecode itself would be extremely simple. Imagine the Rust struct as:
 
 ```
 struct CodeBlock {
-  name: String, // Function name
+  name: Option<String>, // Function name, if any
   frame_slot_count: u32, // Potentially needed
   instrs: Vec<Instruction>, // This function's body
   debug_info: Option<DebugInfo>, // More on this later!
 }
 
 struct Bytecode {
-  // We potentially need to point to a code block for top-level statements, too
+  // Functions are code blocks, but so are top-level statements or attribute
+  // expressions!
   blocks: Vec<CodeBlock>,
   consts: Vec<Constant>, // We can de-dup constants used in multiple functions!
   loads: Vec<ConstIdx>, // Each load is just a constant string
