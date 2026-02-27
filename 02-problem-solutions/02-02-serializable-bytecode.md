@@ -2,6 +2,8 @@
 
 One issue with ZAM is that starting it up, you get a long phase of compiling the scripts down into ZAM. We need a better solution for this. To do this, the bytecode must be serializable. This means that all values used within a given bytecode are in a constant pool. Furthermore, any function calls must get the address somehow.
 
+The bytecode itself is trivial to serialize by design: an opcode is a byte followed by a known number of bytes. These bytes mean special things to that opcode. Thus, we will not discuss how the actual bytecode itself is serialized.
+
 ## Constant Pool
 
 The constant pool will be a vector of a predefined constant. These constants will just be like:

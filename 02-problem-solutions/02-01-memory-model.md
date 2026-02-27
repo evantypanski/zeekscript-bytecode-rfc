@@ -2,30 +2,30 @@
 
 The scripting implementation is deeply coupled with Zeek. Any analyzer written in C++ *directly creates* pointers to script values. Many plugins and core components take in script values in BiFs (built-in functions), translate them into C++ types, then pass that along to some other system.
 
-This is a manual process: users must create values by hand, then retrieve them by hand, from the scripting engine. You may even change values from the scripting engine within the core. 
+This is a manual process: users must create values by hand, then retrieve them by hand, from the scripting engine. You may even change values from the scripting engine within the core.
 
-But, the core does not need to "think" in values like this. It is often better for the core to pass around less, or statically allocate simple objects. Indeed, it does, and many parts only create the Zeek script values when necessary. The goal here, then, is to make the core a *consumer* of the data created by the interpreter. The interpreter owns the data, the core simply updates (or reads) data within it.
+But, the core does not need to "think" in values like this. It is often better for the core to pass around less, or statically allocate simple objects. Indeed, it does, and many parts only create the Zeek script values when necessary. The goal here, then, is to make the core a *produce* data for the interpreter only when necessary. Then, it will *consume* data that would today be provided through BiFs.
 
 ## The Barrier
 
-The core to this problem is how the barrier between the interpreter and core is handled. Since the interpreter owns the values, the core can no longer think in terms of `Val` objects, or intrusive pointers. Instead, there are a set of shared structs which define the memory layout. 
+The core to this problem is how the barrier between the interpreter and core is handled. Since the interpreter owns the values, the core can no longer think in terms of `Val` objects, or intrusive pointers. Instead, there are a set of shared structs which define the memory layout.
 
 First, we have a tagged union. This is basically what `ZVal` is currently. For now, we will ignore the problem of interacting with Zeek values that have not yet swapped, that will come later. Also, this will likely be written in Rust, with `cbindgen` or similar to convert into a header file in C++:
 
 ```
 struct ZVal {
 	uint8_t type_; // The resulting type of the value, without extra info.
-	uint8_t flags; // This plus the `type_` can fully describe which union field 
-				   // to pick. This includes a 'legacy' bit to see if we have to 
+	uint8_t flags; // This plus the `type_` can fully describe which union field
+				   // to pick. This includes a 'legacy' bit to see if we have to
 				   // use as_ptr
-	uint16_t extra; // This would be for optimizations, like a length for short 
+	uint16_t extra; // This would be for optimizations, like a length for short
 					// strings?
-	
+
 	union {
 		int64_t as_int; // zeek_int_t int_val
 		uint64_t as_uint; // zeek_uint_t uint_val
 		double as_double; // double double_val
-		
+
 		// ZVal then has a list of pointers that it uses. Instead, we will
 		// have two options: a pointer into Rust VM memory, or another
 		// raw pointer (which would be the legacy Zeek::Val)
@@ -97,7 +97,7 @@ flowchart LR
     subgraph Rust [Rust VM Host]
         direction TB
         Interpreter[Bytecode Interpreter]
-            
+
         subgraph Storage [Memory Model]
             direction TB
             Scratch[Scratch Arena]
@@ -112,10 +112,10 @@ flowchart LR
     Interpreter -- "Reads/writes legacy values" --> LegacyConv
     LegacyConv -- "Fetches/modifies legacy values" --> LegacyVal
     LegacyConv -- "Convert ZVal back to Val if writing" --> ZValBuilder
-    
+
     Interpreter -- "Read/write" --> Scratch
     Interpreter -- "Read/write" --> Heap
-    
+
     Scratch -.->|Promote/Clone| Heap
 ```
 
@@ -129,7 +129,7 @@ Rc<RefCell<Vec<ZVal>>>
 
 That is, a reference counted, internally-mutable, vector of `ZVal`. When using the bump allocator, it doesn't call every `Drop` method, so we would need to keep the "complex" objects (ie anything represented by a pointer) and manually drop them. That means we don't get the full benefit of the arena. Because of this, that would be the representation in the persistent space, but the scratch space would just be a pointer into scratch space. This means that we create our own object representation.
 
-## Another option: Offsets
+## Another option: Arena Offsets
 
 We could structure the `ZVal` such that pointers back into rust space are purely an offset:
 
@@ -146,15 +146,27 @@ This offset is just an index into a scratch arena.
 
 But, this makes us manage our own arenas. It also means that we're rewriting a lot of infrastructure just for refcounting. We can use built-in mechanisms for this, and use the language to better help us.
 
-## Object Representation
-
-Throughout this document so far, the scratch and persistent spaces have been pointers into two different spaces. This is useful as a model, but in reality, it might be a bit different. These are two *conceptual* spaces, but they really could be 
-
 ## Getting values
 
 We also have to get values! The primary case here is when calling a BiF, where we must translate the script-level `Val` into something the C++ core can handle more easily. For this, we would simply have a similar API to the builder.
 
-There will be more on this in the future, since the primary use here is with BiFs.
+There will be more on this in the future, since the primary use here is with BiFs. But, there is one concern that is worth addressing early: crossing an FFI boundary *constantly* for value manipulation is expensive.
+
+This proposal would essentially treat values as opaque pointers (unless primitives, of course). Say you have a nested record, you might have to do:
+
+```
+auto my_rec = vm_get_rec_field(vm, my_val, 0);
+auto my_count_val = vm_get_rec_field(vm, my_val, 5);
+auto my_count = my_count_val.payload.as_uint;
+```
+
+Readability wise, this is pretty tough. I don't have an exact solution for that, but really it should be solveable with good APIs. For example, we could have record layouts available for lookup by the VM, then the core could point to a nested field and say "give me that." Then the VM goes off and grabs it.
+
+But, if it's not obvious, this would also apply *to all aggregate types*. That means if you want to get all elements within a vector, you would have to cross the FFI boundary *for each one*.
+
+However, I only see this in loggers and cluster publish in the core (which should absolutely be special-cased, discussed later). We could also provide batching operators for vectors. That's certainly reasonable. The point here is that a naive implementation may end up quite slow because each access over an opaque record, vector, or table pointer will be quite slow.
+
+I'm also not sure how much it matters. Zeek itself certainly isn't cleverly designed here. It may be dwarfed by runtime within the core (or within the interpreter) alone. The crux is that if there is a performance issue crossing this FFI boundary, we can provide solutions by asking the VM for a layout of records or batching operations for others.
 
 # Proposal
 
@@ -168,4 +180,4 @@ The proposed solution:
 2) Rust handles all values. If a value is stored within Zeek, it is the user's responsibility to ref/unref it. The VM will properly ref/unref by virtue of using `Rc`. In practice, this should entail changing all `Obj::Ref` and `Obj::Unref` with calls to the C wrappers, which in turn will call the relevant ref and unref function.
 3) Create simple ways for the core to build up values within the interpreter and retrieve values.
 
-This way, we have a clear barrier between the values that a script handles and the values that the core handles. 
+This way, we have a clear barrier between the values that a script handles and the values that the core handles.

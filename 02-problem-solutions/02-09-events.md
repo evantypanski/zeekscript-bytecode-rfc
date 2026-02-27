@@ -30,7 +30,7 @@ We can simply keep this, then hijack `event_registry` just as we proposed for th
 Note that the event pointer will not apply. Here is the definition for `zeek_init`:
 
 ```
-zeek::EventHandlerPtr zeek_init; 
+zeek::EventHandlerPtr zeek_init;
 ```
 
 This means we must change `EventHandler`. After this, it will be an opaque handle into the VM, which it gets from the `Register` call. If a fallback is necessary, it can turn the event handler into either a Rust VM managed handler or a legacy handler, then choose based on that.
