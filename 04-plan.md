@@ -7,6 +7,16 @@ Nonetheless, the goal will not be to provide an accurate *timeframe*, as that fe
 > [!NOTE]
 > There is a large incentive to keep development in-tree within Zeek. This means that development would be in the same code that other Zeek code is, but is not built by default. This means that we can have a full history, as well as an incremental understanding of the code. It's very difficult to be handed large chunks of code and told "maintain this." Because of this, we will assume that this is incrementally developed in-tree just like any bug fixes or other features are.
 
+## Phose 0: Will it work?
+
+The first step will be to ensure this will work. While I don't use AI to code, I don't see much issue with using it to ask questions (... with code). Some questions I still have:
+
+1) Is it feasible to use `Rc` to refcount values in Rust, but manually increment and decrement in C++? Will we get memory leaks or impossible to debug issues? Perhaps we can make an alternative, or our own refcounted type, or something different altogether?
+2) Is the FFI between Rust and C++ a deal breaker? Will it end up extremely slow? Will it be even harder to read?
+3) Can we use Zeek's values in other languages, like Spicy or Javascript, zero-copy? How much change would this require from both?
+
+That's just a few, but the idea of this pre-work is to just experiment. We want to spot fundamental issues early so that we can abort or adjust. This will not be published code.
+
 ## Phase 1: Separation
 
 The first phase would be pretty isolated from Zeek itself. A new interpreter must be able to act independently: it aids with debugging and with easy switching between interpreters. Thus, the first phase would happen without integration with Zeek *at all*. The first step is to create a relatively minimal implementation of ZAM's bytecode in order to build out basic functionality.
